@@ -1,5 +1,0 @@
-model,value
-within_signal,0.9
-gene_prior,0.45
-mixed,0.7
-random,0.4
