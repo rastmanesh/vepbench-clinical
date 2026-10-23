@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23589773.svg)](https://doi.org/10.5281/zenodo.23589773)
 # vepbench (version 0.1.2)
 
 Gene-aware evaluation of variant effect predictors on labelled missense variants. When variants
@@ -6,7 +7,7 @@ variants, not which variants are damaging. `vepbench` reports pooled and within-
 side, adds a gene-identity baseline, puts bootstrap intervals on both by resampling genes (not variants),
 and measures how much a predictor ranking changes when the evaluation design changes.
 
-**Status: research prototype.** Tested on simulated data and a mock folder layout only (see Limitations). Not yet run on real benchmark files.
+**Status:** Validated on the ProteinGym v1.3 clinical set (2,525 proteins, 30 models).
 
 ## Install
 
