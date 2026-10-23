@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Gene-aware analysis of clinical variant benchmarks laid out as in ProteinGym.
+
+Layout assumed (the layout used by the original analysis script; CHECK it against your download):
+  labels-dir/<anything>.csv          one file per protein with a mutant column and a 0/1 label column
+  scores-dir/<model>/<anything>.csv  one sub-folder per model; each file has a mutant column and ONE score column
+The model name is the name of the folder that holds the file.
+
+What this script does differently from a quick correlation script:
+  * nothing is skipped silently: every file and every model is logged with a status and message;
+  * the score column is never guessed: give it in --score-map, or the file must have exactly one numeric
+    column besides the protein and mutant columns; otherwise the model is skipped and listed;
+  * orientation is explicit (--score-map), and models whose pooled AUROC is below 0.5 are flagged;
+  * results are given for each model on all variants it scored AND on the variants scored by every model;
+  * it runs the vepbench evaluation (pooled and per-protein AUROC, intervals, gene-identity baseline, ranking);
+  * the pooled Spearman correlation of the earlier script is also computed so old and new tables can be compared.
+
+NOT TESTED ON REAL FILES: tested only on a mock folder structure (tests/test_clinical_script.py).
+
+Steps:
+  python analysis/run_clinical_analysis.py inspect --labels-dir L --scores-dir S --out inspect_out
+  (edit inspect_out/score_map_template.csv: fill the 'column' for each model and set 'orientation')
+  python analysis/run_clinical_analysis.py run --labels-dir L --scores-dir S --score-map score_map.csv --out results
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+import traceback
+
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from vepbench.cli import evaluate          # noqa: E402
+from vepbench.metrics import auroc         # noqa: E402
+
+
+class ScoreColumnError(Exception):
+    pass
+
+
+def _read(path):
+    df = pd.read_csv(path)
+    df.columns = df.columns.astype(str).str.strip()
+    return df
+
+
+def _protein_series(df, path, protein_col):
+    if protein_col in df.columns:
+        return df[protein_col].astype(str), "column"
+    return pd.Series(os.path.splitext(os.path.basename(path))[0], index=df.index), "filename"
+
+
+def load_labels(labels_dir, label_col, protein_col, mutant_col):
+    frames, audit = [], []
+    files = sorted(glob.glob(os.path.join(labels_dir, "*.csv")))
+    for f in files:
+        rec = dict(file=os.path.basename(f), status="ok", message="", rows=0, n_pos=0, n_neg=0, protein_source="")
+        try:
+            df = _read(f)
+            for need in (mutant_col, label_col):
+                if need not in df.columns:
+                    raise KeyError("column '%s' not found; columns are %s" % (need, list(df.columns)))
+            prot, rec["protein_source"] = _protein_series(df, f, protein_col)
+            lab = pd.to_numeric(df[label_col], errors="coerce")
+            if (~lab.isin([0, 1])).any():
+                raise ValueError("%d labels are not 0/1 (values: %s)" % ((~lab.isin([0, 1])).sum(),
+                                 sorted(df[label_col].astype(str).unique())[:5]))
+            out = pd.DataFrame(dict(protein=prot, mutant=df[mutant_col].astype(str), label=lab.astype(int)))
+            n0 = len(out)
+            out = out.drop_duplicates(["protein", "mutant"])
+            if len(out) < n0:
+                rec["message"] = "%d duplicate keys dropped" % (n0 - len(out))
+            rec.update(rows=len(out), n_pos=int(out.label.sum()), n_neg=int((1 - out.label).sum()))
+            frames.append(out)
+        except Exception as e:
+            rec.update(status="failed", message="%s: %s" % (type(e).__name__, e))
+        audit.append(rec)
+    if not frames:
+        raise SystemExit("no label file could be read; see the audit")
+    return pd.concat(frames, ignore_index=True), pd.DataFrame(audit)
+
+
+def discover_models(scores_dir):
+    models = {}
+    for sf in sorted(glob.glob(os.path.join(scores_dir, "**", "*.csv"), recursive=True)):
+        models.setdefault(os.path.basename(os.path.dirname(sf)), []).append(sf)
+    return models
+
+
+def load_score_map(path):
+    if not path:
+        return {}
+    t = pd.read_csv(path)
+    t.columns = t.columns.str.strip()
+    if not {"model", "column"} <= set(t.columns):
+        raise SystemExit("score map needs columns model,column (and optionally orientation)")
+    m = {}
+    for _, r in t.iterrows():
+        col = r["column"]
+        if isinstance(col, float) and np.isnan(col):
+            continue
+        ori = str(r.get("orientation", "higher_pathogenic")).strip() if "orientation" in t.columns else "higher_pathogenic"
+        if ori not in ("higher_pathogenic", "lower_pathogenic"):
+            raise SystemExit("orientation for %s must be higher_pathogenic or lower_pathogenic" % r["model"])
+        m[str(r["model"])] = dict(column=str(col), orientation=ori)
+    return m
+
+
+def _candidates(df, protein_col, mutant_col):
+    return [c for c in df.columns if c not in (protein_col, mutant_col) and pd.api.types.is_numeric_dtype(df[c])]
+
+
+def load_model(model, files, score_map, protein_col, mutant_col):
+    parts, audit, used = [], [], None
+    for f in files:
+        rec = dict(model=model, file=os.path.relpath(f), status="ok", message="", rows=0, score_column="")
+        try:
+            df = _read(f)
+            if mutant_col not in df.columns:
+                raise KeyError("column '%s' not found; columns are %s" % (mutant_col, list(df.columns)))
+            if model in score_map:
+                col = score_map[model]["column"]
+                if col not in df.columns:
+                    raise KeyError("mapped column '%s' not found; columns are %s" % (col, list(df.columns)))
+            else:
+                cands = _candidates(df, protein_col, mutant_col)
+                if len(cands) != 1:
+                    raise ScoreColumnError("cannot choose the score column automatically; numeric candidates: %s" % cands)
+                col = cands[0]
+            if used is not None and col != used:
+                raise ScoreColumnError("score column '%s' differs from '%s' used in earlier files" % (col, used))
+            used = col
+            prot, _ = _protein_series(df, f, protein_col)
+            sc = pd.to_numeric(df[col], errors="coerce")
+            if model in score_map and score_map[model]["orientation"] == "lower_pathogenic":
+                sc = -sc
+            parts.append(pd.DataFrame(dict(protein=prot, mutant=df[mutant_col].astype(str), score=sc)))
+            rec.update(rows=len(df), score_column=col)
+        except Exception as e:
+            rec.update(status="failed", message="%s: %s" % (type(e).__name__, e))
+        audit.append(rec)
+    if not parts:
+        return None, audit, None
+    out = pd.concat(parts, ignore_index=True)
+    n0 = len(out)
+    out = out.drop_duplicates(["protein", "mutant"])
+    dups = n0 - len(out)
+    return out.rename(columns={"score": model}), audit, (used, dups)
+
+
+def cmd_inspect(a):
+    os.makedirs(a.out, exist_ok=True)
+    models = discover_models(a.scores_dir)
+    rows = []
+    for m, files in models.items():
+        try:
+            df = _read(files[0])
+            cands = _candidates(df, a.protein_col, a.mutant_col)
+            cols = list(df.columns)
+        except Exception as e:
+            cands, cols = [], ["READ FAILED: %s" % e]
+        rows.append(dict(model=m, n_files=len(files), example_file=os.path.relpath(files[0]),
+                         columns=";".join(cols), numeric_candidates=";".join(cands),
+                         column=cands[0] if len(cands) == 1 else "", orientation="higher_pathogenic"))
+    t = pd.DataFrame(rows)
+    t.to_csv(os.path.join(a.out, "score_map_template.csv"), index=False)
+    lab, laud = load_labels(a.labels_dir, a.label_col, a.protein_col, a.mutant_col)
+    laud.to_csv(os.path.join(a.out, "audit_label_files.csv"), index=False)
+    print("models found: %d (single obvious score column for %d); label files read: %d, failed: %d; proteins: %d; variants: %d"
+          % (len(t), int((t["column"] != "").sum()), int((laud.status == "ok").sum()),
+             int((laud.status == "failed").sum()), lab.protein.nunique(), len(lab)))
+    print("Edit %s: fill 'column' where blank, check 'orientation', then run the 'run' command."
+          % os.path.join(a.out, "score_map_template.csv"))
+
+
+def cmd_run(a):
+    os.makedirs(a.out, exist_ok=True)
+    score_map = load_score_map(a.score_map)
+    labels, laud = load_labels(a.labels_dir, a.label_col, a.protein_col, a.mutant_col)
+    laud.to_csv(os.path.join(a.out, "audit_label_files.csv"), index=False)
+    models = discover_models(a.scores_dir)
+    maud, faud, wide, status_rows = [], [], labels.copy(), []
+    for m, files in models.items():
+        sc, audit, info = load_model(m, files, score_map, a.protein_col, a.mutant_col)
+        faud.extend(audit)
+        if sc is None:
+            status_rows.append(dict(model=m, status="skipped", n_files=len(files), n_files_ok=0, score_column="",
+                                    duplicates_dropped=0, message="; ".join(sorted({r["message"] for r in audit if r["message"]}))[:400]))
+            continue
+        ok_files = sum(r["status"] == "ok" for r in audit)
+        msg = "" if ok_files == len(files) else "%d of %d files failed (see audit_score_files.csv)" % (len(files) - ok_files, len(files))
+        wide = wide.merge(sc, on=["protein", "mutant"], how="left")
+        status_rows.append(dict(model=m, status="analysed", n_files=len(files), n_files_ok=ok_files,
+                                score_column=info[0], duplicates_dropped=info[1], message=msg))
+    pd.DataFrame(faud).to_csv(os.path.join(a.out, "audit_score_files.csv"), index=False)
+    st = pd.DataFrame(status_rows)
+    names = st.loc[st.status == "analysed", "model"].tolist()
+    if not names:
+        st.to_csv(os.path.join(a.out, "audit_models.csv"), index=False)
+        raise SystemExit("no model could be analysed; see audit_models.csv")
+    st["coverage"] = st["model"].map({m: float(wide[m].notna().mean()) for m in names})
+    st.to_csv(os.path.join(a.out, "audit_models.csv"), index=False)
+
+    # orientation check and the legacy pooled Spearman (for comparison with the earlier table)
+    leg, ori = [], []
+    for m in names:
+        d = wide[["label", m]].dropna()
+        rho = spearmanr(d["label"], d[m]).statistic
+        leg.append(dict(model=m, original_correlation=round(float(rho), 4), absolute_correlation=round(abs(float(rho)), 4), n_mutations=len(d)))
+        au = auroc(d["label"].to_numpy(), d[m].to_numpy())
+        ori.append(dict(model=m, pooled_auroc=au, warning="pooled AUROC < 0.5: check orientation in the score map" if au < 0.5 else ""))
+    leg = pd.DataFrame(leg).sort_values("absolute_correlation", ascending=False)
+    leg.to_csv(os.path.join(a.out, "legacy_pooled_spearman.csv"), index=False)
+    pd.DataFrame(ori).to_csv(os.path.join(a.out, "orientation_check.csv"), index=False)
+    if a.previous_table:
+        prev = pd.read_csv(a.previous_table).rename(columns=str.strip)
+        cmp_ = prev.merge(leg, left_on="Model", right_on="model", how="outer", indicator=True)
+        cmp_["note"] = cmp_["_merge"].map({"left_only": "in previous table, not analysed now",
+                                           "right_only": "analysed now, not in previous table", "both": ""})
+        cmp_["difference_in_n"] = cmp_["N_Mutations"] - cmp_["n_mutations"]
+        cmp_["difference_in_abs_corr"] = cmp_["Absolute_Correlation"] - cmp_["absolute_correlation"]
+        cmp_.insert(0, "model_name", cmp_["Model"].fillna(cmp_["model"]))
+        cmp_.drop(columns=["_merge"]).to_csv(os.path.join(a.out, "comparison_with_previous_table.csv"), index=False)
+
+    ext = None
+    if a.external:
+        t = pd.read_csv(a.external)
+        ext = pd.Series(t["value"].to_numpy(), index=t["model"].to_numpy())
+    summary = dict(proteins=int(wide.protein.nunique()), variants=int(len(wide)), models_analysed=len(names),
+                   models_skipped=int((st.status == "skipped").sum()), label_files_failed=int((laud.status == "failed").sum()))
+    for tag, df in (("all_scored", wide),
+                    ("common_variants", wide.dropna(subset=names))):
+        if tag == "common_variants":
+            summary["common_variants"] = int(len(df))
+            if len(df) < 500 or df.protein.nunique() < 5:
+                summary["common_variants_note"] = "too few variants scored by every model; common-set analysis skipped"
+                continue
+        res = evaluate(df, "protein", "label", names, a.min_per_class, a.n_boot, a.seed, external=ext)
+        d = os.path.join(a.out, tag)
+        os.makedirs(d, exist_ok=True)
+        res["models"].to_csv(os.path.join(d, "models.csv"), index=False)
+        res["per_group"].to_csv(os.path.join(d, "per_protein_auroc.csv"), index=False)
+        res["aggregation"].to_csv(os.path.join(d, "aggregation_comparison.csv"), index=False)
+        res["gene_identity"].to_csv(os.path.join(d, "gene_identity_baseline.csv"), index=False)
+        with open(os.path.join(d, "summary.json"), "w") as fh:
+            json.dump({k: v for k, v in res.items() if isinstance(v, dict)}, fh, indent=2)
+    with open(os.path.join(a.out, "RUN_SUMMARY.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(json.dumps(summary, indent=2))
+    if summary["models_skipped"] or summary["label_files_failed"]:
+        print("WARNING: some models or label files were skipped or failed; read audit_models.csv, audit_score_files.csv, audit_label_files.csv")
+    return summary
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("inspect", "run"):
+        s = sub.add_parser(name)
+        s.add_argument("--labels-dir", required=True)
+        s.add_argument("--scores-dir", required=True)
+        s.add_argument("--label-col", default="DMS_score_bin", help="binary label column, 1 = pathogenic (default DMS_score_bin)")
+        s.add_argument("--protein-col", default="protein", help="protein column; if absent the file name is used")
+        s.add_argument("--mutant-col", default="mutant")
+        s.add_argument("--out", required=True)
+        if name == "run":
+            s.add_argument("--score-map", default=None, help="CSV: model,column[,orientation]")
+            s.add_argument("--min-per-class", type=int, default=5)
+            s.add_argument("--n-boot", type=int, default=200)
+            s.add_argument("--seed", type=int, default=0)
+            s.add_argument("--external", default=None, help="CSV model,value: independent ranking, e.g. deep mutational scanning")
+            s.add_argument("--previous-table", default=None, help="earlier correlation table to reconcile (Model,Original_Correlation,Absolute_Correlation,N_Mutations)")
+    return p
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    return cmd_inspect(a) if a.cmd == "inspect" else cmd_run(a)
+
+
+if __name__ == "__main__":
+    main()
