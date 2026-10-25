@@ -1,4 +1,4 @@
-"""Command-line interface: ``python -m vepbench evaluate ...``"""
+﻿"""Command-line interface: ``python -m vepbench evaluate ...``"""
 import argparse
 import json
 import os
@@ -9,7 +9,10 @@ import pandas as pd
 from .io import load_table
 from .metrics import auroc, average_precision, sensitivity_at_specificity, partial_auroc
 from .genelevel import per_group_auroc, summarize_per_group, compare_aggregations, gene_identity_report
-from .bootstrap import bootstrap_pergroup_mean, bootstrap_pooled_auroc, percentile_ci
+from .pair_diagnostics import between_group_auroc, pair_composition, protein_mean_vs_residual_auroc
+from .bootstrap import (bootstrap_pergroup_mean, bootstrap_pooled_auroc, bootstrap_within_group_auroc,
+                        percentile_ci)
+from .genelevel import within_group_auroc
 from .ranking import compare_rankings, bootstrap_rank_agreement
 from . import __version__
 
@@ -27,8 +30,21 @@ def evaluate(df, group, label, scores, min_per_class=5, n_boot=200, seed=0,
         pg_all.append(pg)
         elig = set(pg.loc[pg["auroc"].notna(), "group"])
         se = sub[sub[group].isin(elig)]
+        _pc = pair_composition(df, group, label, c)
+        _gap = protein_mean_vs_residual_auroc(df, group, label, c)
+        _between = between_group_auroc(df, group, label, c)
         row = dict(model=c, n_scored=int(len(sub)), coverage=float(len(sub) / len(df)),
                    pooled_auroc=pooled,
+                   within_pairwise_auroc=within_group_auroc(df, group, label, c, 1),
+                   between_group_auroc=_between,
+                   protein_mean_auroc=_gap["protein_mean_auroc"],
+                   protein_residual_auroc=_gap["protein_residual_auroc"],
+                   gap_mean_minus_residual=_gap["gap_mean_minus_residual"],
+                   total_pairs=_pc["total_pairs"],
+                   within_pairs=_pc["within_pairs"],
+                   between_pairs=_pc["between_pairs"],
+                   within_share=_pc["within_share"],
+                   between_share=_pc["between_share"],
                    pooled_auroc_eligible_genes=(auroc(se[label].to_numpy(), se[c].to_numpy()) if elig else float("nan")), pergroup_mean_auroc=sm["mean"],
                    pergroup_weighted_auroc=sm["weighted_mean"], pergroup_median_auroc=sm["median"],
                    n_eligible_groups=sm["n_eligible"],
@@ -41,14 +57,19 @@ def evaluate(df, group, label, scores, min_per_class=5, n_boot=200, seed=0,
             row["pooled_ci_low"], row["pooled_ci_high"] = percentile_ci(bp)
             bg = bootstrap_pergroup_mean(pg["auroc"].to_numpy(), n_boot, seed)
             row["pergroup_ci_low"], row["pergroup_ci_high"] = percentile_ci(bg)
+            bw = bootstrap_within_group_auroc(df, group, label, c, n_boot, seed)
+            row["within_pairwise_ci_low"], row["within_pairwise_ci_high"] = percentile_ci(bw)
         rows.append(row)
     models = pd.DataFrame(rows)
     agg = compare_aggregations(df, group, label, scores, min_per_class)
     baseline = gene_identity_report(df, group, label, n_splits=n_splits, seed=seed,
                                     min_per_class=min_per_class)
     ranking = compare_rankings(agg.set_index("model")["pooled"], agg.set_index("model")["pergroup"])
+    ai = agg.set_index("model")
     result = dict(models=models, per_group=pd.concat(pg_all, ignore_index=True),
-                  aggregation=agg, gene_identity=baseline, ranking_pooled_vs_pergroup=ranking)
+                  aggregation=agg, gene_identity=baseline, ranking_pooled_vs_pergroup=ranking,
+                  ranking_pooled_eligible_vs_pergroup=compare_rankings(ai["pooled_eligible"], ai["pergroup"]),
+                  ranking_pooled_vs_within_pairwise=compare_rankings(ai["pooled"], ai["within_pairwise"]))
     if n_boot > 0 and len(scores) > 1:
         samples, summ = bootstrap_rank_agreement(df, group, label, scores, n_boot=n_boot, seed=seed,
                                                  min_per_class=min_per_class, external=external)
@@ -61,6 +82,14 @@ def evaluate(df, group, label, scores, min_per_class=5, n_boot=200, seed=0,
     return result
 
 
+def _table(df):
+    """Markdown table if the optional 'tabulate' package is installed, plain text otherwise."""
+    try:
+        return df.to_markdown(index=False)
+    except ImportError:
+        return df.to_string(index=False)
+
+
 def _report(result, args, n_rows, n_groups):
     m = result["models"]
     lines = ["# vepbench evaluation report", "",
@@ -68,7 +97,7 @@ def _report(result, args, n_rows, n_groups):
              % (__version__, args.seed, args.n_boot),
              "Variants: %d in %d groups. Labels: 1 = pathogenic, 0 = benign. Minimum variants per class per group: %d." %
              (n_rows, n_groups, args.min_per_class), "",
-             "## Predictors", "", m.round(3).to_markdown(index=False) if hasattr(m, "to_markdown") else m.round(3).to_string(index=False),
+             "## Predictors", "", _table(m.round(3)),
              "", "## Gene-identity baseline (a predictor that knows only the gene)", "",
              result["gene_identity"].round(3).to_string(index=False),
              "", "## Pooled versus per-group ranking", "", json.dumps(result["ranking_pooled_vs_pergroup"], indent=2)]
@@ -123,3 +152,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
