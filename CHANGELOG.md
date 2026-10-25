@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 ## 0.1.4
 - New: `between_group_auroc` — pairwise between-group AUROC (complement of `within_group_auroc` on pair counts).
