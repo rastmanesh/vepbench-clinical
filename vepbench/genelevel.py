@@ -1,6 +1,7 @@
 """Gene-aware evaluation: per-group metrics, aggregation contrasts, gene-identity baselines."""
 import numpy as np
 import pandas as pd
+from scipy.stats import rankdata
 from .metrics import auroc
 
 
@@ -21,6 +22,85 @@ def per_group_auroc(df, group, label, score, min_per_class=5):
         a = auroc(y, s) if (n1 >= min_per_class and n0 >= min_per_class) else float("nan")
         rows.append((g, n1, n0, a))
     return pd.DataFrame(rows, columns=["group", "n_pos", "n_neg", "auroc"])
+
+
+def _group_u_and_pairs(df, group, label, score, min_per_class=1):
+    """Per-group Mann-Whitney U and number of (pathogenic, benign) pairs, for groups with both classes."""
+    d = df[[group, label, score]].dropna(subset=[score])
+    u, pairs = [], []
+    for _, sub in d.groupby(group, sort=False):
+        y = sub[label].to_numpy()
+        n1 = int(y.sum())
+        n0 = int(y.size - n1)
+        if n1 < max(1, min_per_class) or n0 < max(1, min_per_class):
+            continue
+        r = rankdata(sub[score].to_numpy(float))
+        u.append(r[y == 1].sum() - n1 * (n1 + 1) / 2.0)
+        pairs.append(float(n1 * n0))
+    return np.array(u), np.array(pairs)
+
+
+def within_group_auroc(df, group, label, score, min_per_class=1):
+    """Pairwise within-group AUROC.
+
+    The share of (pathogenic, benign) pairs that are ordered correctly, counting only pairs of
+    variants from the SAME group (ties count one half). It is the pair-weighted mean of the per-group
+    AUROCs and, unlike the per-group mean, needs only one variant of each class per group, so it uses
+    almost every group instead of discarding those below ``--min-per-class``. Larger groups carry more weight.
+    Returns NaN if no group has both classes.
+    """
+    u, pairs = _group_u_and_pairs(df, group, label, score, min_per_class)
+    return float(u.sum() / pairs.sum()) if pairs.size else float("nan")
+
+
+def pair_composition(df, group, label, score):
+    """How the (pathogenic, benign) pairs of one predictor split into within-group and between-group pairs.
+
+    Pooled AUROC counts every pathogenic-benign pair. When groups are many and small, almost all of those pairs
+    compare variants from DIFFERENT groups, so the pooled value is nearly a between-group statistic.
+    Returns total_pairs, within_pairs, between_pairs, within_share, between_share.
+    """
+    d = df[[group, label, score]].dropna(subset=[score])
+    y = d[label].to_numpy()
+    n1_all, n0_all = int(y.sum()), int(y.size - y.sum())
+    g = d.groupby(group)[label].agg(["sum", "size"])
+    n1 = g["sum"].to_numpy(float)
+    n0 = g["size"].to_numpy(float) - n1
+    total = float(n1_all) * float(n0_all)
+    within = float((n1 * n0).sum())
+    between = total - within
+    nan = float("nan")
+    return dict(total_pairs=total, within_pairs=within, between_pairs=between,
+                within_share=within / total if total else nan, between_share=between / total if total else nan)
+
+
+def between_group_auroc(df, group, label, score):
+    """Pairwise between-group AUROC: share of (pathogenic, benign) pairs from DIFFERENT groups ordered correctly.
+
+    Exact: pooled U statistic minus the within-group U, divided by the number of between-group pairs.
+    The pooled AUROC is the pair-weighted mean of the within-group and between-group AUROCs.
+    """
+    d = df[[group, label, score]].dropna(subset=[score])
+    comp = pair_composition(d, group, label, score)
+    if not comp["between_pairs"]:
+        return float("nan")
+    u_total = auroc(d[label].to_numpy(), d[score].to_numpy()) * comp["total_pairs"]
+    u_within, pairs = _group_u_and_pairs(d, group, label, score, 1)
+    return float((u_total - u_within.sum()) / comp["between_pairs"])
+
+
+def between_minus_within(df, group, label, score):
+    """Between-group AUROC minus within-group AUROC, with the pair shares.
+
+    Reading the sign needs care. Positive: ordering across groups is better than ordering inside groups, which
+    happens when the score tracks each group's pathogenic fraction (gene-level information helps the pooled value).
+    Negative: ordering inside groups is better, which happens when scores are not comparable across groups
+    (their scale shifts from group to group). The gap is a net effect of the two and cannot separate them.
+    """
+    comp = pair_composition(df, group, label, score)
+    w = within_group_auroc(df, group, label, score, 1)
+    b = between_group_auroc(df, group, label, score)
+    return dict(within_auroc=w, between_auroc=b, gap_between_minus_within=b - w, **comp)
 
 
 def summarize_per_group(pg):
@@ -59,6 +139,7 @@ def compare_aggregations(df, group, label, score_cols, min_per_class=5):
         se = sub[sub[group].isin(set(elig))]
         pooled_e = auroc(se[label].to_numpy(), se[c].to_numpy()) if len(elig) else float("nan")
         rows.append(dict(model=c, pooled=pooled, pooled_eligible=pooled_e, pergroup=sm["mean"],
+                         within_pairwise=within_group_auroc(df, group, label, c, 1),
                          pergroup_weighted=sm["weighted_mean"],
                          n_eligible_groups=sm["n_eligible"],
                          coverage=float(df[c].notna().mean())))
@@ -69,6 +150,7 @@ def compare_aggregations(df, group, label, score_cols, min_per_class=5):
     out["rank_pooled"] = out["pooled"].rank(ascending=False, method="average")
     out["rank_pooled_eligible"] = out["pooled_eligible"].rank(ascending=False, method="average")
     out["rank_pergroup"] = out["pergroup"].rank(ascending=False, method="average")
+    out["rank_within_pairwise"] = out["within_pairwise"].rank(ascending=False, method="average")
     out["rank_change"] = out["rank_pooled"] - out["rank_pergroup"]
     return out
 
