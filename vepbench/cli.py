@@ -1,4 +1,4 @@
-﻿"""Command-line interface: ``python -m vepbench evaluate ...``"""
+"""Command-line interface: ``python -m vepbench evaluate ...``"""
 import argparse
 import json
 import os
@@ -9,10 +9,9 @@ import pandas as pd
 from .io import load_table
 from .metrics import auroc, average_precision, sensitivity_at_specificity, partial_auroc
 from .genelevel import per_group_auroc, summarize_per_group, compare_aggregations, gene_identity_report
-from .pair_diagnostics import between_group_auroc, pair_composition, protein_mean_vs_residual_auroc
-from .bootstrap import (bootstrap_pergroup_mean, bootstrap_pooled_auroc, bootstrap_within_group_auroc,
+from .bootstrap import (bootstrap_decomposition, bootstrap_pergroup_mean, bootstrap_pooled_auroc, bootstrap_within_group_auroc,
                         percentile_ci)
-from .genelevel import within_group_auroc
+from .genelevel import within_group_auroc, between_minus_within
 from .ranking import compare_rankings, bootstrap_rank_agreement
 from . import __version__
 
@@ -28,23 +27,13 @@ def evaluate(df, group, label, scores, min_per_class=5, n_boot=200, seed=0,
         sm = summarize_per_group(pg)
         pg = pg.assign(model=c)
         pg_all.append(pg)
+        dec = between_minus_within(df, group, label, c)
         elig = set(pg.loc[pg["auroc"].notna(), "group"])
         se = sub[sub[group].isin(elig)]
-        _pc = pair_composition(df, group, label, c)
-        _gap = protein_mean_vs_residual_auroc(df, group, label, c)
-        _between = between_group_auroc(df, group, label, c)
         row = dict(model=c, n_scored=int(len(sub)), coverage=float(len(sub) / len(df)),
                    pooled_auroc=pooled,
-                   within_pairwise_auroc=within_group_auroc(df, group, label, c, 1),
-                   between_group_auroc=_between,
-                   protein_mean_auroc=_gap["protein_mean_auroc"],
-                   protein_residual_auroc=_gap["protein_residual_auroc"],
-                   gap_mean_minus_residual=_gap["gap_mean_minus_residual"],
-                   total_pairs=_pc["total_pairs"],
-                   within_pairs=_pc["within_pairs"],
-                   between_pairs=_pc["between_pairs"],
-                   within_share=_pc["within_share"],
-                   between_share=_pc["between_share"],
+                   within_pairwise_auroc=dec["within_auroc"], between_pairwise_auroc=dec["between_auroc"],
+                   gap_between_minus_within=dec["gap_between_minus_within"], within_pair_share=dec["within_share"],
                    pooled_auroc_eligible_genes=(auroc(se[label].to_numpy(), se[c].to_numpy()) if elig else float("nan")), pergroup_mean_auroc=sm["mean"],
                    pergroup_weighted_auroc=sm["weighted_mean"], pergroup_median_auroc=sm["median"],
                    n_eligible_groups=sm["n_eligible"],
@@ -57,8 +46,10 @@ def evaluate(df, group, label, scores, min_per_class=5, n_boot=200, seed=0,
             row["pooled_ci_low"], row["pooled_ci_high"] = percentile_ci(bp)
             bg = bootstrap_pergroup_mean(pg["auroc"].to_numpy(), n_boot, seed)
             row["pergroup_ci_low"], row["pergroup_ci_high"] = percentile_ci(bg)
-            bw = bootstrap_within_group_auroc(df, group, label, c, n_boot, seed)
-            row["within_pairwise_ci_low"], row["within_pairwise_ci_high"] = percentile_ci(bw)
+            bd = bootstrap_decomposition(df, group, label, c, n_boot, seed)
+            row["within_pairwise_ci_low"], row["within_pairwise_ci_high"] = percentile_ci(bd["within"].to_numpy())
+            row["between_pairwise_ci_low"], row["between_pairwise_ci_high"] = percentile_ci(bd["between"].to_numpy())
+            row["gap_between_minus_within_ci_low"], row["gap_between_minus_within_ci_high"] = percentile_ci(bd["gap_between_minus_within"].to_numpy())
         rows.append(row)
     models = pd.DataFrame(rows)
     agg = compare_aggregations(df, group, label, scores, min_per_class)
@@ -152,4 +143,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-
