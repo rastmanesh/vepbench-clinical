@@ -92,3 +92,55 @@ def bootstrap_pooled_auroc(df, group, label, score, n_boot=200, seed=0):
         rows = np.concatenate([idx[i] for i in pick])
         out[b] = auroc(y[rows], s[rows])
     return out
+
+
+def bootstrap_within_group_auroc(df, group, label, score, n_boot=1000, seed=0, min_per_class=1):
+    """Cluster bootstrap of the pairwise within-group AUROC (groups are resampled)."""
+    from .genelevel import _group_u_and_pairs
+    u, pairs = _group_u_and_pairs(df, group, label, score, min_per_class)
+    if pairs.size == 0:
+        return np.full(n_boot, np.nan)
+    rng = np.random.default_rng(seed)
+    pick = rng.integers(0, pairs.size, size=(n_boot, pairs.size))
+    return u[pick].sum(axis=1) / pairs[pick].sum(axis=1)
+
+
+def bootstrap_decomposition(df, group, label, score, n_boot=1000, seed=0):
+    """Cluster bootstrap of pooled, within-group, between-group AUROC and their gap (groups are resampled).
+
+    The same seed gives the same resampled groups for every predictor. Returns a DataFrame with one row per resample.
+    """
+    from .metrics import auroc
+    from .genelevel import _group_u_and_pairs
+    d = df[[group, label, score]].dropna(subset=[score])
+    codes, uniq = pd.factorize(d[group])
+    order = np.argsort(codes, kind="stable")
+    bounds = np.r_[0, np.cumsum(np.bincount(codes))]
+    ng = bounds.size - 1
+    idx = [order[bounds[i]:bounds[i + 1]] for i in range(ng)]
+    y = d[label].to_numpy()
+    s = d[score].to_numpy(float)
+    n1 = np.array([y[i].sum() for i in idx], float)
+    n0 = np.array([i.size for i in idx], float) - n1
+    # per-group within-group U (0 where a group lacks a class)
+    u = np.zeros(ng)
+    from scipy.stats import rankdata
+    for k, i in enumerate(idx):
+        if n1[k] > 0 and n0[k] > 0:
+            r = rankdata(s[i])
+            u[k] = r[y[i] == 1].sum() - n1[k] * (n1[k] + 1) / 2.0
+    pw = n1 * n0
+    rng = np.random.default_rng(seed)
+    rows = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, ng, size=ng)
+        rws = np.concatenate([idx[i] for i in pick])
+        N1, N0 = n1[pick].sum(), n0[pick].sum()
+        total = N1 * N0
+        Pw = pw[pick].sum()
+        Uw = u[pick].sum()
+        pooled = auroc(y[rws], s[rws])
+        within = Uw / Pw if Pw > 0 else np.nan
+        between = (pooled * total - Uw) / (total - Pw) if total > Pw else np.nan
+        rows.append((pooled, within, between, between - within))
+    return pd.DataFrame(rows, columns=["pooled", "within", "between", "gap_between_minus_within"])
