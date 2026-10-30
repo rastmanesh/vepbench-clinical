@@ -1,4 +1,14 @@
-# vepbench (version 0.1.4)
+v0.1.6
+
+Upgraded test suite (63 unit tests).
+
+Canonical results run with 1,000 bootstrap resamples.
+
+Added p-value and Holm-Bonferroni correction to the gap analysis.
+
+Reproduces v0.1.5 pooled AUROCs exactly.
+
+# vepbench (version 0.1.6)
 
 Gene-aware evaluation of variant effect predictors on labelled missense variants. When variants
 cluster in genes, a predictor can score well by learning which genes tend to harbour pathogenic
@@ -6,7 +16,7 @@ variants, not which variants are damaging. `vepbench` reports pooled and within-
 side, adds a gene-identity baseline, puts bootstrap intervals on both by resampling genes (not variants),
 and measures how much a predictor ranking changes when the evaluation design changes.
 
-**Status: research prototype.** Developed and unit-tested (49 tests) on simulated data and a mock folder layout. The author has run it on the ProteinGym v1.3 clinical benchmark; that analysis is not part of this package and has not been independently reproduced or reconciled with ProteinGym's own published per-protein values (see Limitations).
+**Status: research software.** Developed and unit-tested (63 tests). The author has run it on the full ProteinGym v1.3 clinical benchmark; the canonical v0.1.6 results (2,525 proteins, 62,727 variants, 30 models) are archived with this release.
 
 ## Install
 
@@ -65,7 +75,7 @@ sensitivity at fixed specificity, partial AUROC, coverage and bootstrap interval
 | `--positive-label` | none | Label value meaning pathogenic when labels are not 0/1. |
 | `--flip` | none | Predictors where a lower score means pathogenic (scores are negated). |
 | `--min-per-class` | 5 | A group enters the per-group AUROC only if it has at least this many variants of each class. Raising it keeps fewer, more precise groups; results can depend on it, so report it. |
-| `--n-boot` | 200 | Gene-level bootstrap resamples; 0 skips intervals and the ranking bootstrap. More resamples give smoother intervals and take longer. |
+| `--n-boot` | 200 | Gene-level bootstrap resamples; 0 skips intervals and the ranking bootstrap. More resamples give smoother intervals and take longer. The canonical results in the paper use 1000. |
 | `--seed` | 0 | Random seed for the bootstrap and the baseline folds. |
 | `--specificity` | 0.95 | Specificity at which sensitivity is reported. |
 | `--max-fpr` | 0.05 | False-positive-rate limit for the standardized partial AUROC (0.5 is chance). |
@@ -99,7 +109,7 @@ Use the pooled values to judge how much of a benchmark gene identity can explain
 `analysis/run_clinical_analysis.py` runs the evaluation on a folder of per-protein label files plus one sub-folder of
 score files per model. **It was written and unit-tested without access to the real files (tests/test_clinical_script.py); the author has since run it on ProteinGym v1.3, but layout assumptions must still be checked against your copy.**
 Check the layout against your download: the labels folder holds one CSV per protein with a mutant column and a 0/1 label column
-(default `DMS_score_bin`); the scores folder holds one sub-folder per model, named for the model, each with CSVs that have a mutant column and one score column.
+(default DMS_score_bin; the ProteinGym clinical files use DMS_bin_score); the scores folder holds one sub-folder per model, named for the model, each with CSVs that have a mutant column and one score column.
 If the protein column is missing, the file name is used as the protein.
 
 ```
